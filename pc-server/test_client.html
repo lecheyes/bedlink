@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BedLink - teste de áudio</title>
+<link rel="icon" href="data:,">
+<style>
+  body { margin: 0; padding: 16px; font: 16px system-ui, sans-serif; background: #121212; color: #e6e6e6; }
+  main { max-width: 480px; margin: auto; }
+  h1 { font-size: 20px; }
+  button { width: 100%; padding: 16px; font-size: 18px; border: 0; border-radius: 8px; background: #3d6ff0; color: #fff; }
+  button.on { background: #c0392b; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; }
+  dt { color: #999; }
+  dd { margin: 0; overflow-wrap: anywhere; }
+  meter { width: 100%; height: 18px; }
+  #warn { color: #ffcc66; }
+  pre { max-height: 180px; overflow: auto; background: #000; padding: 8px; font-size: 12px; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<main>
+  <h1>BedLink - teste de áudio</h1>
+  <button id="btn" type="button">Conectar</button>
+  <p><label><input type="checkbox" id="play"> Tocar o áudio recebido do PC</label></p>
+  <p id="warn" role="status"></p>
+  <dl>
+    <dt>Sinalização</dt><dd id="ws">desconectado</dd>
+    <dt>WebRTC</dt><dd id="rtc">-</dd>
+    <dt>Ping</dt><dd id="ping">-</dd>
+    <dt>PC → aqui</dt><dd><meter id="inLevel" min="0" max="1" value="0"></meter><span id="inText">-</span></dd>
+    <dt>Mic → PC</dt><dd><meter id="outLevel" min="0" max="1" value="0"></meter><span id="outText">-</span></dd>
+    <dt>VB-CABLE</dt><dd id="cable">-</dd>
+    <dt>Erro do PC</dt><dd id="err">-</dd>
+  </dl>
+  <audio id="audio" autoplay playsinline></audio>
+  <pre id="log"></pre>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const audio = $("audio");
+const samePc = document.body.dataset.samePc === "1" ||
+  ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
+const pcNote = samePc ? "Esta é a página no próprio PC: o áudio começa mudo para não realimentar o loopback, " +
+  "e conectar aqui derruba a sessão do celular." : "";
+let session = null;
+
+function warn(text) {
+  $("warn").textContent = [pcNote, text].filter(Boolean).join(" ");
+}
+
+$("play").checked = !samePc;
+audio.muted = samePc;
+warn("");
+$("play").onchange = () => {
+  audio.muted = !$("play").checked;
+  if (!audio.muted && audio.srcObject) audio.play().catch((e) => log("Reprodução bloqueada: " + e.name));
+};
+
+function log(text) {
+  $("log").textContent += new Date().toLocaleTimeString() + "  " + text + "\n";
+  $("log").scrollTop = $("log").scrollHeight;
+}
+
+function resetPanel() {
+  for (const id of ["rtc", "ping", "inText", "outText", "cable", "err"]) $(id).textContent = "-";
+  $("inLevel").value = 0;
+  $("outLevel").value = 0;
+}
+
+async function getMic() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    const scheme = navigator.brave ? "brave" : navigator.userAgent.includes("Edg") ? "edge" : "chrome";
+    warn("Microfone bloqueado em HTTP. Neste navegador abra " + scheme +
+      "://flags/#unsafely-treat-insecure-origin-as-secure, adicione " + location.origin +
+      ", ative e reinicie o navegador. Conectando só para ouvir.");
+    return null;
+  }
+  try {
+    return await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+  } catch (e) {
+    warn("Microfone indisponível (" + e.name + "). Conectando só para ouvir.");
+    return null;
+  }
+}
+
+async function connect() {
+  const s = { pending: [], remoteSet: false, timers: [], last: null, pingAt: 0 };
+  session = s;
+  $("btn").textContent = "Desconectar";
+  $("btn").classList.add("on");
+  resetPanel();
+  $("ws").textContent = "preparando microfone";
+  // Libera a reprodução ainda dentro do gesto do usuário.
+  audio.play().catch(() => {});
+
+  try {
+    s.mic = await getMic();
+    if (session !== s) { stopMic(s); return; }
+
+    const pc = s.pc = new RTCPeerConnection({ iceServers: [] });
+    if (s.mic) pc.addTransceiver(s.mic.getAudioTracks()[0], { direction: "sendrecv", streams: [s.mic] });
+    else pc.addTransceiver("audio", { direction: "recvonly" });
+    if (!s.mic) $("outText").textContent = "sem microfone";
+
+    const dc = pc.createDataChannel("control");
+    dc.onmessage = (ev) => {
+      if (session !== s) return;
+      let m;
+      try { m = JSON.parse(ev.data); } catch { return; }
+      if (m.type === "status") {
+        $("cable").textContent = m.vb_cable_ok ? "OK" : "indisponível";
+        $("err").textContent = m.error || "nenhum";
+      }
+    };
+
+    pc.ontrack = (ev) => {
+      if (session !== s) return;
+      audio.srcObject = ev.streams[0] || new MediaStream([ev.track]);
+      audio.play().catch((e) => log("Toque em 'Tocar o áudio' (" + e.name + ")"));
+      log("Áudio do PC recebido");
+    };
+    pc.onconnectionstatechange = () => {
+      if (session !== s) return;
+      $("rtc").textContent = pc.connectionState;
+      log("WebRTC: " + pc.connectionState);
+      if (pc.connectionState === "failed") disconnect("falha na conexão WebRTC");
+    };
+
+    const ws = s.ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+    const send = (m) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(m)); };
+    $("ws").textContent = "conectando";
+
+    pc.onicecandidate = (ev) => {
+      if (ev.candidate) {
+        send({ type: "ice", candidate: ev.candidate.candidate, sdpMid: ev.candidate.sdpMid,
+               sdpMLineIndex: ev.candidate.sdpMLineIndex });
+      }
+    };
+    ws.onopen = async () => {
+      if (session !== s) return;
+      $("ws").textContent = "conectado";
+      try {
+        await pc.setLocalDescription(await pc.createOffer());
+        send({ type: "offer", sdp: pc.localDescription.sdp });
+      } catch (e) { disconnect("erro na offer: " + e.message); return; }
+      s.timers.push(setInterval(() => { s.pingAt = performance.now(); send({ type: "ping" }); }, 3000));
+      s.timers.push(setInterval(() => updateStats(s).catch(() => {}), 500));
+    };
+
+    // Mensagens são processadas em ordem; ICE só entra depois de setRemoteDescription.
+    let chain = Promise.resolve();
+    ws.onmessage = (ev) => {
+      chain = chain.then(async () => {
+        if (session !== s) return;
+        const m = JSON.parse(ev.data);
+        if (m.type === "answer") {
+          await pc.setRemoteDescription({ type: "answer", sdp: m.sdp });
+          s.remoteSet = true;
+          for (const c of s.pending.splice(0)) await pc.addIceCandidate(c);
+        } else if (m.type === "ice") {
+          const c = { candidate: m.candidate, sdpMid: m.sdpMid, sdpMLineIndex: m.sdpMLineIndex };
+          if (s.remoteSet) await pc.addIceCandidate(c); else s.pending.push(c);
+        } else if (m.type === "pong") {
+          $("ping").textContent = Math.round(performance.now() - s.pingAt) + " ms";
+        } else if (m.type === "ping") {
+          send({ type: "pong" });
+        }
+      }).catch((e) => log("Erro de sinalização: " + e.message));
+    };
+    ws.onclose = (ev) => {
+      if (session === s) disconnect("servidor fechou (" + ev.code + (ev.reason ? " " + ev.reason : "") + ")");
+    };
+  } catch (e) {
+    if (session === s) disconnect("erro: " + e.message);
+  }
+}
+
+async function updateStats(s) {
+  const stats = await s.pc.getStats();
+  if (session !== s) return;
+  const now = { t: performance.now(), rx: 0, tx: 0 };
+  let inbound = null, source = null, rtt = null;
+  stats.forEach((r) => {
+    if (r.type === "inbound-rtp" && r.kind === "audio") { inbound = r; now.rx = r.bytesReceived; }
+    if (r.type === "outbound-rtp" && r.kind === "audio") now.tx = r.bytesSent;
+    if (r.type === "media-source" && r.kind === "audio") source = r;
+    if (r.type === "candidate-pair" && r.nominated && r.currentRoundTripTime !== undefined) rtt = r.currentRoundTripTime;
+  });
+  const secs = s.last ? (now.t - s.last.t) / 1000 : 0;
+  const kbps = (k) => secs > 0 ? Math.round((now[k] - s.last[k]) * 8 / 1000 / secs) : 0;
+  if (inbound) {
+    $("inLevel").value = Math.min(1, Math.sqrt(inbound.audioLevel || 0));
+    $("inText").textContent = kbps("rx") + " kbps, jitter " + Math.round((inbound.jitter || 0) * 1000) +
+      " ms, perdidos " + (inbound.packetsLost || 0) + (rtt !== null ? ", RTT " + Math.round(rtt * 1000) + " ms" : "");
+  }
+  if (s.mic) {
+    $("outLevel").value = Math.min(1, Math.sqrt((source && source.audioLevel) || 0));
+    $("outText").textContent = kbps("tx") + " kbps";
+  }
+  s.last = now;
+}
+
+function stopMic(s) {
+  if (s.mic) s.mic.getTracks().forEach((t) => t.stop());
+}
+
+function disconnect(reason) {
+  const s = session;
+  session = null;
+  if (s) {
+    s.timers.forEach(clearInterval);
+    stopMic(s);
+    if (s.pc) s.pc.close();
+    if (s.ws) s.ws.close();
+  }
+  audio.srcObject = null;
+  $("btn").textContent = "Conectar";
+  $("btn").classList.remove("on");
+  resetPanel();
+  $("ws").textContent = "desconectado";
+  log(reason || "Desconectado");
+}
+
+$("btn").onclick = () => session ? disconnect() : connect();
+window.addEventListener("pagehide", () => { if (session) disconnect(); });
+</script>
+</body>
+</html>

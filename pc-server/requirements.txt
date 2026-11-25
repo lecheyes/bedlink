@@ -1,0 +1,10 @@
+# Instalar com: pip install --only-binary=:all: -r requirements.txt  (Python 3.11/3.12; evita compilar av)
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+aiortc>=1.9.0,<2.0
+av>=12.0.0,<15.0
+PyAudioWPatch>=0.2.12.6
+sounddevice>=0.5.0,<0.6
+numpy>=1.26,<3.0
+windows-capture>=1.4.0
+dxcam>=0.0.5
